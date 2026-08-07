@@ -8003,7 +8003,7 @@ impl<F: BufFactory> Connection<F> {
             }
 
             if let Some(pmtud) = path.pmtud.as_mut() {
-                pmtud.clamp_maximum_supported_mtu(pmtud_maximum_supported_mtu);
+                pmtud.update_maximum_supported_mtu(pmtud_maximum_supported_mtu);
                 path.recovery
                     .pmtud_update_max_datagram_size(pmtud.get_probe_size());
             } else if is_active {

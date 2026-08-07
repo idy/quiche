@@ -603,6 +603,66 @@ fn handshake_resumption(
     assert!(pipe.server.is_resumed());
 }
 
+#[test]
+fn resumed_connection_uses_current_peer_pmtud_limit() {
+    const OLD_PEER_LIMIT: usize = 1350;
+    const CURRENT_PEER_LIMIT: usize = 1500;
+    const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_max_send_udp_payload_size(CURRENT_PEER_LIMIT);
+    client_config.discover_pmtu(true);
+    client_config.enable_early_data();
+
+    let mut old_server_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    old_server_config.set_max_recv_udp_payload_size(OLD_PEER_LIMIT);
+    old_server_config
+        .set_ticket_key(&SESSION_TICKET_KEY)
+        .unwrap();
+    old_server_config.enable_early_data();
+
+    let mut old_pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut old_server_config,
+    )
+    .unwrap();
+    assert_eq!(old_pipe.handshake(), Ok(()));
+    let session = old_pipe.client.session().unwrap().to_vec();
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_max_send_udp_payload_size(CURRENT_PEER_LIMIT);
+    client_config.discover_pmtu(true);
+    client_config.enable_early_data();
+
+    let mut current_server_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    current_server_config.set_max_recv_udp_payload_size(CURRENT_PEER_LIMIT);
+    current_server_config
+        .set_ticket_key(&SESSION_TICKET_KEY)
+        .unwrap();
+    current_server_config.enable_early_data();
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut current_server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.client.set_session(&session), Ok(()));
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert!(pipe.client.is_resumed());
+
+    let pmtud = pipe
+        .client
+        .paths
+        .get_active()
+        .unwrap()
+        .pmtud
+        .as_ref()
+        .unwrap();
+    assert_eq!(pmtud.get_probe_size(), CURRENT_PEER_LIMIT);
+}
+
 #[rstest]
 fn handshake_alpn_mismatch(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
