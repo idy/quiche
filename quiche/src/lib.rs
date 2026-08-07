@@ -7986,28 +7986,30 @@ impl<F: BufFactory> Connection<F> {
 
         self.recovery_config.max_ack_delay = max_ack_delay;
 
-        let active_path = self.paths.get_active_mut()?;
+        let peer_max_udp_payload_size = peer_params.max_udp_payload_size as usize;
+        let pmtud_maximum_supported_mtu = self
+            .local_transport_params
+            .max_udp_payload_size
+            .try_into()
+            .unwrap_or(self.recovery_config.max_send_udp_payload_size)
+            .min(self.recovery_config.max_send_udp_payload_size)
+            .min(peer_max_udp_payload_size);
+        let active_path_id = self.paths.get_active_path_id()?;
 
-        active_path.recovery.update_max_ack_delay(max_ack_delay);
+        for (path_id, path) in self.paths.iter_mut() {
+            let is_active = path_id == active_path_id;
+            if is_active {
+                path.recovery.update_max_ack_delay(max_ack_delay);
+            }
 
-        if active_path
-            .pmtud
-            .as_ref()
-            .map(|pmtud| pmtud.should_probe())
-            .unwrap_or(false)
-        {
-            active_path.recovery.pmtud_update_max_datagram_size(
-                active_path
-                    .pmtud
-                    .as_mut()
-                    .expect("PMTUD existence verified above")
-                    .get_probe_size()
-                    .min(peer_params.max_udp_payload_size as usize),
-            );
-        } else {
-            active_path.recovery.update_max_datagram_size(
-                peer_params.max_udp_payload_size as usize,
-            );
+            if let Some(pmtud) = path.pmtud.as_mut() {
+                pmtud.clamp_maximum_supported_mtu(pmtud_maximum_supported_mtu);
+                path.recovery
+                    .pmtud_update_max_datagram_size(pmtud.get_probe_size());
+            } else if is_active {
+                path.recovery
+                    .update_max_datagram_size(peer_max_udp_payload_size);
+            }
         }
 
         // Record the max_active_conn_id parameter advertised by the peer.
@@ -8993,6 +8995,7 @@ impl<F: BufFactory> Connection<F> {
         &mut self, recv_pid: Option<usize>, dcid: &ConnectionId, buf_len: usize,
         info: &RecvInfo,
     ) -> Result<usize> {
+        let pmtud_maximum_supported_mtu = self.pmtud_maximum_supported_mtu();
         let ids = &mut self.ids;
 
         let (in_scid_seq, mut in_scid_pid) =
@@ -9069,7 +9072,7 @@ impl<F: BufFactory> Connection<F> {
 
         if self.discover_pmtu {
             path.pmtud = Some(pmtud::Pmtud::new(
-                self.recovery_config.max_send_udp_payload_size,
+                pmtud_maximum_supported_mtu,
                 self.pmtud_max_probes,
             ));
         }
@@ -9226,7 +9229,7 @@ impl<F: BufFactory> Connection<F> {
         );
         if self.discover_pmtu {
             path.pmtud = Some(pmtud::Pmtud::new(
-                self.recovery_config.max_send_udp_payload_size,
+                self.pmtud_maximum_supported_mtu(),
                 self.pmtud_max_probes,
             ));
         }
@@ -9239,6 +9242,24 @@ impl<F: BufFactory> Connection<F> {
         self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
 
         Ok(pid)
+    }
+
+    fn pmtud_maximum_supported_mtu(&self) -> usize {
+        let local_max_udp_payload_size = self
+            .local_transport_params
+            .max_udp_payload_size
+            .try_into()
+            .unwrap_or(self.recovery_config.max_send_udp_payload_size);
+        let peer_max_udp_payload_size = if self.parsed_peer_transport_params {
+            self.peer_transport_params.max_udp_payload_size as usize
+        } else {
+            usize::MAX
+        };
+
+        self.recovery_config
+            .max_send_udp_payload_size
+            .min(local_max_udp_payload_size)
+            .min(peer_max_udp_payload_size)
     }
 
     // Marks the connection as closed and does any related tidyup.

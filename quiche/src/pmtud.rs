@@ -99,6 +99,21 @@ impl Pmtud {
         self.probe_size
     }
 
+    /// Lowers the largest probe size to a newly learned protocol limit.
+    ///
+    /// QUIC peers advertise their maximum UDP payload size during the
+    /// handshake, after the initial path's PMTUD state has been created. Keep
+    /// every current and future probe within that peer limit.
+    pub fn clamp_maximum_supported_mtu(&mut self, maximum_supported_mtu: usize) {
+        if maximum_supported_mtu >= self.maximum_supported_mtu {
+            return;
+        }
+
+        self.maximum_supported_mtu = maximum_supported_mtu;
+        self.restart_pmtud();
+        self.in_flight = false;
+    }
+
     /// Returns the largest successful PMTUD probe size if one exists, otherwise
     /// returns the minimum supported MTU.
     pub fn get_current_mtu(&self) -> usize {
@@ -280,6 +295,17 @@ mod tests {
         let pmtud = Pmtud::new(1500, 5);
         assert_eq!(pmtud.max_probes, 5);
         assert_ne!(pmtud.max_probes, MAX_PROBES_DEFAULT);
+    }
+
+    #[test]
+    fn pmtud_clamps_probe_to_peer_limit() {
+        let mut pmtud = Pmtud::new(1500, 1);
+        pmtud.set_in_flight(true);
+
+        pmtud.clamp_maximum_supported_mtu(1350);
+
+        assert_eq!(pmtud.get_probe_size(), 1350);
+        assert!(pmtud.should_probe());
     }
 
     #[test]

@@ -11229,6 +11229,71 @@ fn runtime_paths_inherit_pmtud_configuration() {
     );
 }
 
+#[test]
+fn pmtud_probes_respect_peer_udp_payload_limit_on_all_paths() {
+    const LOCAL_PROBE_SIZE: usize = 1500;
+    const PEER_LIMIT: usize = 1350;
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_active_connection_id_limit(2);
+    client_config.set_max_send_udp_payload_size(LOCAL_PROBE_SIZE);
+    client_config.discover_pmtu(true);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.set_active_connection_id_limit(2);
+    server_config.set_max_recv_udp_payload_size(PEER_LIMIT);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get_active()
+            .unwrap()
+            .pmtud
+            .as_ref()
+            .unwrap()
+            .get_probe_size(),
+        PEER_LIMIT
+    );
+
+    let (server_cid, server_reset_token) =
+        test_utils::create_cid_and_reset_token(16);
+    let (client_cid, client_reset_token) =
+        test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid(&client_cid, client_reset_token, true),
+        Ok(1)
+    );
+    assert_eq!(
+        pipe.server.new_scid(&server_cid, server_reset_token, true),
+        Ok(1)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let runtime_client_addr = "127.0.0.1:5678".parse().unwrap();
+    assert_eq!(
+        pipe.client.probe_path(runtime_client_addr, server_addr),
+        Ok(1)
+    );
+    let runtime_path = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(runtime_client_addr, server_addr))
+        .and_then(|id| pipe.client.paths.get(id).ok())
+        .unwrap();
+    assert_eq!(
+        runtime_path.pmtud.as_ref().unwrap().get_probe_size(),
+        PEER_LIMIT
+    );
+}
+
 #[rstest]
 fn connection_migration_zero_length_cid(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
