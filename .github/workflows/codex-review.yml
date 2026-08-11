@@ -1,0 +1,126 @@
+name: OpenAI PR review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+  issue_comment:
+    types: [created]
+  issues:
+    types: [edited, reopened, typed, untyped]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Open internal pull request to review.
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: openai-pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pull_request_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event_name != 'issues'
+    uses: GizClaw/github-workflows/.github/workflows/codex-openai-review.yml@cff6ec446b57dff4cd682dd8539bc6de79f516c4
+    with:
+      model: gpt-5.6-terra
+      effort: medium
+      max-diff-bytes: 5000000
+      review-instructions: >-
+        Follow the trusted-base AGENTS.md hierarchy and review the complete
+        pull-request diff for actionable correctness, security, protocol,
+        lifecycle, API-contract, and test-coverage findings.
+      issue-review-instructions: >-
+        Follow the trusted-base AGENTS.md hierarchy. Treat the linked Issue and
+        its pinned protocol drafts or standards as requirements, and verify
+        them against the current source and repository conventions.
+      pr-readiness-instructions: >-
+        Require valid PR metadata, native implementation-Issue linkage,
+        Issue-plan conformance, current validation evidence, and no actionable
+        findings.
+      pull_request_number: ${{ inputs.pull_request_number }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  resolve_linked_prs:
+    if: github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: read
+    outputs:
+      pull_requests: ${{ steps.links.outputs.pull_requests }}
+      pull_request_count: ${{ steps.links.outputs.pull_request_count }}
+    steps:
+      - id: links
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const data = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    closedByPullRequestsReferences(first: 50) {
+                      totalCount
+                      nodes { number state }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: Number(context.payload.issue.number),
+            });
+            const references = data.repository.issue
+              ?.closedByPullRequestsReferences;
+            if (!references) {
+              throw new Error('Issue was not found');
+            }
+            if (references.totalCount > references.nodes.length) {
+              throw new Error(
+                'Could not resolve every linked pull request within the configured bound',
+              );
+            }
+            const pullRequests = references.nodes
+              .filter((pullRequest) => pullRequest.state === 'OPEN')
+              .map((pullRequest) => pullRequest.number);
+            core.setOutput('pull_requests', JSON.stringify(pullRequests));
+            core.setOutput('pull_request_count', String(pullRequests.length));
+
+  refresh_linked_prs:
+    needs: resolve_linked_prs
+    if: >-
+      needs.resolve_linked_prs.result == 'success'
+      && needs.resolve_linked_prs.outputs.pull_request_count != '0'
+    strategy:
+      fail-fast: false
+      matrix:
+        pull_request_number: ${{ fromJSON(needs.resolve_linked_prs.outputs.pull_requests) }}
+    uses: GizClaw/github-workflows/.github/workflows/codex-openai-review.yml@cff6ec446b57dff4cd682dd8539bc6de79f516c4
+    with:
+      model: gpt-5.6-terra
+      effort: medium
+      max-diff-bytes: 5000000
+      review-instructions: >-
+        Follow the trusted-base AGENTS.md hierarchy and review the complete
+        pull-request diff for actionable correctness, security, protocol,
+        lifecycle, API-contract, and test-coverage findings.
+      issue-review-instructions: >-
+        Follow the trusted-base AGENTS.md hierarchy. Treat the linked Issue and
+        its pinned protocol drafts or standards as requirements, and verify
+        them against the current source and repository conventions.
+      pr-readiness-instructions: >-
+        Require valid PR metadata, native implementation-Issue linkage,
+        Issue-plan conformance, current validation evidence, and no actionable
+        findings.
+      pull_request_number: ${{ matrix.pull_request_number }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

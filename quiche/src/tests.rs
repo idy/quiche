@@ -53,6 +53,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        grease_quic_bit: false,
         unknown_params: Default::default(),
     };
 
@@ -83,6 +84,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        grease_quic_bit: false,
         unknown_params: Default::default(),
     };
 
@@ -94,6 +96,107 @@ fn transport_params() {
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();
 
     assert_eq!(new_tp, tp);
+}
+
+#[test]
+fn grease_quic_bit_transport_parameter() {
+    let tp = TransportParams {
+        grease_quic_bit: true,
+        ..TransportParams::default()
+    };
+
+    let mut encoded = [0; 256];
+    let encoded = TransportParams::encode(&tp, false, &mut encoded).unwrap();
+    let decoded = TransportParams::decode(encoded, true, None).unwrap();
+    assert!(decoded.grease_quic_bit);
+
+    // 0x2ab2 followed by an empty value.
+    let decoded = TransportParams::decode(&[0x6a, 0xb2, 0], true, None).unwrap();
+    assert!(decoded.grease_quic_bit);
+
+    // RFC 9287 requires the transport parameter value to be empty.
+    assert_eq!(
+        TransportParams::decode(&[0x6a, 0xb2, 1, 0], true, None),
+        Err(Error::InvalidTransportParam)
+    );
+}
+
+#[test]
+fn grease_quic_bit_packet_parsing_and_serialization() {
+    let cid = [1, 2, 3, 4];
+    let mut cleared = [0, 1, 2, 3, 4];
+    let mut input = octets::OctetsMut::with_slice(&mut cleared);
+    assert_eq!(
+        Header::from_bytes(&mut input, cid.len()),
+        Err(Error::InvalidPacket)
+    );
+
+    let mut input = octets::OctetsMut::with_slice(&mut cleared);
+    let parsed =
+        Header::from_bytes_with_grease(&mut input, cid.len(), true).unwrap();
+    assert_eq!(parsed.ty, Type::Short);
+    assert_eq!(parsed.dcid.as_ref(), cid);
+
+    let header = Header {
+        ty: Type::Short,
+        version: 0,
+        dcid: ConnectionId::from_ref(&cid),
+        scid: ConnectionId::default(),
+        pkt_num: 0,
+        pkt_num_len: 1,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+    let mut default = [0; 5];
+    header
+        .to_bytes(&mut octets::OctetsMut::with_slice(&mut default))
+        .unwrap();
+    assert_ne!(default[0] & 0x40, 0);
+
+    let mut observed_set = false;
+    let mut observed_clear = false;
+    for _ in 0..1024 {
+        let mut randomized = [0; 5];
+        header
+            .to_bytes_with_grease(
+                &mut octets::OctetsMut::with_slice(&mut randomized),
+                true,
+            )
+            .unwrap();
+        observed_set |= randomized[0] & 0x40 != 0;
+        observed_clear |= randomized[0] & 0x40 == 0;
+    }
+    assert!(observed_set && observed_clear);
+}
+
+#[test]
+fn connection_id_metadata_exposes_sequence_and_reset_token() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let active = pipe.client.source_id_metadata();
+    assert_eq!(active.connection_id(), &pipe.client.source_id());
+    assert_eq!(active.sequence(), 0);
+
+    let cid = ConnectionId::from_ref(&[0x5a; 16]);
+    let reset_token = u128::from_be_bytes([0xa5; 16]);
+    assert_eq!(pipe.client.new_scid(&cid, reset_token, false), Ok(1));
+
+    let replacement = pipe
+        .client
+        .source_ids_metadata()
+        .find(|metadata| metadata.sequence() == 1)
+        .unwrap();
+    assert_eq!(replacement.connection_id().as_ref(), cid.as_ref());
+    assert_eq!(replacement.reset_token(), Some(reset_token));
+
+    let destination = pipe.client.destination_id_metadata();
+    assert_eq!(destination.connection_id(), &pipe.client.destination_id());
+    assert!(pipe
+        .client
+        .destination_ids_metadata()
+        .any(|metadata| metadata.sequence() == destination.sequence()));
 }
 
 #[test]
@@ -601,6 +704,66 @@ fn handshake_resumption(
 
     assert!(pipe.client.is_resumed());
     assert!(pipe.server.is_resumed());
+}
+
+#[test]
+fn resumed_connection_uses_current_peer_pmtud_limit() {
+    const OLD_PEER_LIMIT: usize = 1350;
+    const CURRENT_PEER_LIMIT: usize = 1500;
+    const SESSION_TICKET_KEY: [u8; 48] = [0xa; 48];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_max_send_udp_payload_size(CURRENT_PEER_LIMIT);
+    client_config.discover_pmtu(true);
+    client_config.enable_early_data();
+
+    let mut old_server_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    old_server_config.set_max_recv_udp_payload_size(OLD_PEER_LIMIT);
+    old_server_config
+        .set_ticket_key(&SESSION_TICKET_KEY)
+        .unwrap();
+    old_server_config.enable_early_data();
+
+    let mut old_pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut old_server_config,
+    )
+    .unwrap();
+    assert_eq!(old_pipe.handshake(), Ok(()));
+    let session = old_pipe.client.session().unwrap().to_vec();
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_max_send_udp_payload_size(CURRENT_PEER_LIMIT);
+    client_config.discover_pmtu(true);
+    client_config.enable_early_data();
+
+    let mut current_server_config =
+        test_utils::Pipe::default_config("cubic").unwrap();
+    current_server_config.set_max_recv_udp_payload_size(CURRENT_PEER_LIMIT);
+    current_server_config
+        .set_ticket_key(&SESSION_TICKET_KEY)
+        .unwrap();
+    current_server_config.enable_early_data();
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut current_server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.client.set_session(&session), Ok(()));
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert!(pipe.client.is_resumed());
+
+    let pmtud = pipe
+        .client
+        .paths
+        .get_active()
+        .unwrap()
+        .pmtud
+        .as_ref()
+        .unwrap();
+    assert_eq!(pmtud.get_probe_size(), CURRENT_PEER_LIMIT);
 }
 
 #[rstest]
@@ -11185,6 +11348,115 @@ fn connection_migration(
     );
 }
 
+#[test]
+fn runtime_paths_inherit_pmtud_configuration() {
+    const PROBE_SIZE: usize = 1350;
+
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+    config.set_max_send_udp_payload_size(PROBE_SIZE);
+    config.discover_pmtu(true);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+    let server_addr = test_utils::Pipe::server_addr();
+    let client_addr = "127.0.0.1:5678".parse().unwrap();
+
+    assert_eq!(pipe.client.probe_path(client_addr, server_addr), Ok(1));
+    let client_path = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(client_addr, server_addr))
+        .and_then(|id| pipe.client.paths.get(id).ok())
+        .expect("client runtime path");
+    let client_pmtud = client_path.pmtud.as_ref().expect("client PMTUD state");
+    assert_eq!(client_pmtud.get_probe_size(), PROBE_SIZE);
+
+    assert_eq!(pipe.advance(), Ok(()));
+    let server_path = pipe
+        .server
+        .paths
+        .path_id_from_addrs(&(server_addr, client_addr))
+        .and_then(|id| pipe.server.paths.get(id).ok())
+        .expect("server runtime path");
+    assert!(
+        server_path.pmtud.is_some(),
+        "server runtime path must inherit PMTUD state"
+    );
+}
+
+#[test]
+fn pmtud_probes_respect_peer_udp_payload_limit_on_all_paths() {
+    const LOCAL_PROBE_SIZE: usize = 1500;
+    const PEER_LIMIT: usize = 1350;
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.set_active_connection_id_limit(2);
+    client_config.set_max_send_udp_payload_size(LOCAL_PROBE_SIZE);
+    client_config.discover_pmtu(true);
+
+    let mut server_config = test_utils::Pipe::default_config("cubic").unwrap();
+    server_config.set_active_connection_id_limit(2);
+    server_config.set_max_recv_udp_payload_size(PEER_LIMIT);
+
+    let mut pipe = test_utils::Pipe::with_client_and_server_config(
+        &mut client_config,
+        &mut server_config,
+    )
+    .unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    assert_eq!(
+        pipe.client
+            .paths
+            .get_active()
+            .unwrap()
+            .pmtud
+            .as_ref()
+            .unwrap()
+            .get_probe_size(),
+        PEER_LIMIT
+    );
+
+    let (server_cid, server_reset_token) =
+        test_utils::create_cid_and_reset_token(16);
+    let (client_cid, client_reset_token) =
+        test_utils::create_cid_and_reset_token(16);
+    assert_eq!(
+        pipe.client.new_scid(&client_cid, client_reset_token, true),
+        Ok(1)
+    );
+    assert_eq!(
+        pipe.server.new_scid(&server_cid, server_reset_token, true),
+        Ok(1)
+    );
+    assert_eq!(pipe.advance(), Ok(()));
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let runtime_client_addr = "127.0.0.1:5678".parse().unwrap();
+    assert_eq!(
+        pipe.client.probe_path(runtime_client_addr, server_addr),
+        Ok(1)
+    );
+    let runtime_path = pipe
+        .client
+        .paths
+        .path_id_from_addrs(&(runtime_client_addr, server_addr))
+        .and_then(|id| pipe.client.paths.get(id).ok())
+        .unwrap();
+    assert_eq!(
+        runtime_path.pmtud.as_ref().unwrap().get_probe_size(),
+        PEER_LIMIT
+    );
+}
+
 #[rstest]
 fn connection_migration_zero_length_cid(
     #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -12930,4 +13202,96 @@ fn server_qlog() {
     } else {
         panic!("expected Qlog event");
     }
+}
+
+#[test]
+fn sending_on_probing_path_does_not_consume_active_path_pmtud_probe() {
+    const PROBE_SIZE: usize = 1400;
+
+    let mut config = Config::new(PROTOCOL_VERSION).unwrap();
+
+    config
+        .load_cert_chain_from_pem_file("examples/cert.crt")
+        .unwrap();
+
+    config
+        .load_priv_key_from_pem_file("examples/cert.key")
+        .unwrap();
+
+    config.set_application_protos(&[b"proto1"]).unwrap();
+    config.verify_peer(false);
+    config.set_active_connection_id_limit(2);
+    config.set_max_send_udp_payload_size(PROBE_SIZE);
+    config.discover_pmtu(true);
+
+    let mut pipe = pipe_with_exchanged_cids(&mut config, 16, 16, 1);
+
+    // `old_path` is the current active path.
+    let old_path_id = pipe.server.paths.get_active_path_id().unwrap();
+
+    // PMTU revalidation is requested on `old_path`.
+    pipe.server.revalidate_pmtu();
+
+    // `old_path` now has a pending PMTUD probe.
+    assert!(
+        pipe.server
+            .paths
+            .get(old_path_id)
+            .unwrap()
+            .pmtud
+            .as_ref()
+            .unwrap()
+            .should_probe(),
+        "`old_path` should have a pending PMTUD probe"
+    );
+
+    let server_addr = test_utils::Pipe::server_addr();
+    let new_client_addr = "127.0.0.1:5678".parse().unwrap();
+    let mut out = vec![0; PROBE_SIZE];
+
+    // The client starts validating `new_path`.
+    pipe.client
+        .probe_path(new_client_addr, server_addr)
+        .unwrap();
+
+    // The client sends a PATH_CHALLENGE frame on `new_path`.
+    let (written, info) = pipe
+        .client
+        .send_on_path(&mut out, Some(new_client_addr), Some(server_addr))
+        .unwrap();
+
+    assert_eq!(info.from, new_client_addr);
+    assert_eq!(info.to, server_addr);
+
+    // The server receives the PATH_CHALLENGE, creates `new_path`, and
+    // queues a PATH_RESPONSE frame.
+    pipe.server
+        .recv(&mut out[..written], RecvInfo {
+            from: info.from,
+            to: info.to,
+        })
+        .unwrap();
+
+    // `new_path` is being validated, but `old_path` remains active.
+    assert_eq!(pipe.server.paths.get_active_path_id().unwrap(), old_path_id);
+
+    // The next server packet is sent on `new_path`.
+    let (_, info) = pipe.server.send(&mut out).unwrap();
+
+    assert_eq!(info.from, server_addr);
+    assert_eq!(info.to, new_client_addr);
+
+    // Sending on `new_path` must not consume the pending PMTUD probe
+    // associated with `old_path`.
+    assert!(
+        pipe.server
+            .paths
+            .get(old_path_id)
+            .unwrap()
+            .pmtud
+            .as_ref()
+            .unwrap()
+            .should_probe(),
+        "sending on `new_path` consumed `old_path`'s PMTUD probe"
+    );
 }

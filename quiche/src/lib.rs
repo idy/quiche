@@ -558,6 +558,28 @@ pub enum QlogLevel {
     Extra = 2,
 }
 
+/// Borrowed metadata for an active QUIC connection ID.
+pub struct ConnectionIdMetadata<'a> {
+    entry: &'a cid::ConnectionIdEntry,
+}
+
+impl<'a> ConnectionIdMetadata<'a> {
+    /// Returns the connection ID bytes.
+    pub fn connection_id(&self) -> &ConnectionId<'a> {
+        &self.entry.cid
+    }
+
+    /// Returns the QUIC connection ID sequence number.
+    pub fn sequence(&self) -> u64 {
+        self.entry.seq
+    }
+
+    /// Returns the stateless reset token, when one is available.
+    pub fn reset_token(&self) -> Option<u128> {
+        self.entry.reset_token
+    }
+}
+
 /// Stores configuration shared between multiple connections.
 pub struct Config {
     local_transport_params: TransportParams,
@@ -1075,6 +1097,14 @@ impl Config {
         self.local_transport_params.disable_active_migration = v;
     }
 
+    /// Enables RFC 9287 QUIC Bit greasing for new connections.
+    ///
+    /// When enabled, the endpoint advertises the empty `grease_quic_bit`
+    /// transport parameter and accepts packets whose Fixed Bit is zero.
+    pub fn enable_grease_quic_bit(&mut self, enabled: bool) {
+        self.local_transport_params.grease_quic_bit = enabled;
+    }
+
     /// Sets the congestion control algorithm used.
     ///
     /// The default value is `CongestionControlAlgorithm::CUBIC`.
@@ -1355,6 +1385,12 @@ where
 
     /// The configuration for recovery.
     recovery_config: recovery::RecoveryConfig,
+
+    /// Whether newly-created runtime paths inherit PMTU discovery.
+    discover_pmtu: bool,
+
+    /// Maximum probe attempts inherited by newly-created runtime paths.
+    pmtud_max_probes: u8,
 
     /// The path manager.
     paths: path::PathMap,
@@ -2079,6 +2115,9 @@ impl<F: BufFactory> Connection<F> {
             session: None,
 
             recovery_config,
+
+            discover_pmtu: config.pmtud,
+            pmtud_max_probes: config.pmtud_max_probes,
 
             paths,
             path_challenge_recv_max_queue_len: config
@@ -2980,15 +3019,14 @@ impl<F: BufFactory> Connection<F> {
 
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, self.source_id().len())
-            .map_err(|e| {
-                drop_pkt_on_err(
-                    e,
-                    self.recv_count,
-                    self.is_server,
-                    &self.trace_id,
-                )
-            })?;
+        let mut hdr = Header::from_bytes_with_grease(
+            &mut b,
+            self.source_id().len(),
+            self.local_transport_params.grease_quic_bit,
+        )
+        .map_err(|e| {
+            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+        })?;
 
         if hdr.ty == Type::VersionNegotiation {
             // Version negotiation packets can only be sent by the server.
@@ -4005,19 +4043,23 @@ impl<F: BufFactory> Connection<F> {
         let send_path = self.paths.get_mut(send_pid)?;
 
         // Update max datagram size to allow path MTU discovery probe to be sent.
-        if let Some(pmtud) = send_path.pmtud.as_mut() {
-            if pmtud.should_probe() {
-                let size = if self.handshake_confirmed || self.handshake_completed
-                {
-                    pmtud.get_probe_size()
-                } else {
-                    pmtud.get_current_mtu()
-                };
+        if send_path.validated() {
+            if let Some(pmtud) = send_path.pmtud.as_mut() {
+                if pmtud.should_probe() {
+                    let size =
+                        if self.handshake_confirmed || self.handshake_completed {
+                            pmtud.get_probe_size()
+                        } else {
+                            pmtud.get_current_mtu()
+                        };
 
-                send_path.recovery.pmtud_update_max_datagram_size(size);
+                    send_path.recovery.pmtud_update_max_datagram_size(size);
 
-                left =
-                    cmp::min(out.len(), send_path.recovery.max_datagram_size());
+                    left = cmp::min(
+                        out.len(),
+                        send_path.recovery.max_datagram_size(),
+                    );
+                }
             }
         }
 
@@ -4436,7 +4478,11 @@ impl<F: BufFactory> Connection<F> {
             key_phase: self.key_phase,
         };
 
-        hdr.to_bytes(&mut b)?;
+        hdr.to_bytes_with_grease(
+            &mut b,
+            self.parsed_peer_transport_params &&
+                self.peer_transport_params.grease_quic_bit,
+        )?;
 
         let hdr_trace = if log::max_level() == log::LevelFilter::Trace {
             Some(format!("{hdr:?}"))
@@ -4587,8 +4633,8 @@ impl<F: BufFactory> Connection<F> {
             // In addition, the PMTUD probe is only generated when the handshake
             // is confirmed, to avoid interfering with the handshake
             // (e.g. due to the anti-amplification limits).
-            if let Ok(active_path) = self.paths.get_active_mut() {
-                let should_probe_pmtu = active_path.should_send_pmtu_probe(
+            if let Ok(send_path) = self.paths.get_mut(send_pid) {
+                let should_probe_pmtu = send_path.should_send_pmtu_probe(
                     self.handshake_confirmed,
                     self.handshake_completed,
                     out_len,
@@ -4597,7 +4643,7 @@ impl<F: BufFactory> Connection<F> {
                 );
 
                 if should_probe_pmtu {
-                    if let Some(pmtud) = active_path.pmtud.as_mut() {
+                    if let Some(pmtud) = send_path.pmtud.as_mut() {
                         let probe_size = pmtud.get_probe_size();
                         trace!(
                         "{} sending pmtud probe pmtu_probe={} estimated_pmtu={}",
@@ -4620,7 +4666,7 @@ impl<F: BufFactory> Connection<F> {
                                 //
                                 // In such case app_limited is set to false here
                                 // to make cwnd grow when ACK is received.
-                                active_path.recovery.update_app_limited(false);
+                                send_path.recovery.update_app_limited(false);
                                 return Err(Error::Done);
                             },
                         }
@@ -7666,6 +7712,31 @@ impl<F: BufFactory> Connection<F> {
         self.ids.scids_iter()
     }
 
+    /// Returns metadata for the source connection ID selected by
+    /// [`source_id()`].
+    pub fn source_id_metadata(&self) -> ConnectionIdMetadata<'_> {
+        if let Ok(path) = self.paths.get_active() {
+            if let Some(active_scid_seq) = path.active_scid_seq {
+                if let Ok(entry) = self.ids.get_scid(active_scid_seq) {
+                    return ConnectionIdMetadata { entry };
+                }
+            }
+        }
+
+        ConnectionIdMetadata {
+            entry: self.ids.oldest_scid(),
+        }
+    }
+
+    /// Returns metadata for all active source connection IDs.
+    pub fn source_ids_metadata(
+        &self,
+    ) -> impl Iterator<Item = ConnectionIdMetadata<'_>> {
+        self.ids
+            .scid_entries_iter()
+            .map(|entry| ConnectionIdMetadata { entry })
+    }
+
     /// Returns the destination connection ID.
     ///
     /// Note that the value returned can change throughout the connection's
@@ -7682,6 +7753,37 @@ impl<F: BufFactory> Connection<F> {
 
         let e = self.ids.oldest_dcid();
         ConnectionId::from_ref(e.cid.as_ref())
+    }
+
+    /// Returns metadata for the destination connection ID selected by
+    /// [`destination_id()`].
+    pub fn destination_id_metadata(&self) -> ConnectionIdMetadata<'_> {
+        if let Ok(path) = self.paths.get_active() {
+            if let Some(active_dcid_seq) = path.active_dcid_seq {
+                if let Ok(entry) = self.ids.get_dcid(active_dcid_seq) {
+                    return ConnectionIdMetadata { entry };
+                }
+            }
+        }
+
+        ConnectionIdMetadata {
+            entry: self.ids.oldest_dcid(),
+        }
+    }
+
+    /// Returns metadata for all active destination connection IDs.
+    pub fn destination_ids_metadata(
+        &self,
+    ) -> impl Iterator<Item = ConnectionIdMetadata<'_>> {
+        self.ids
+            .dcid_entries_iter()
+            .map(|entry| ConnectionIdMetadata { entry })
+    }
+
+    /// Returns whether the peer advertised RFC 9287 QUIC Bit greasing.
+    pub fn peer_grease_quic_bit(&self) -> bool {
+        self.parsed_peer_transport_params &&
+            self.peer_transport_params.grease_quic_bit
     }
 
     /// Returns the PMTU for the active path if it exists.
@@ -7973,28 +8075,30 @@ impl<F: BufFactory> Connection<F> {
 
         self.recovery_config.max_ack_delay = max_ack_delay;
 
-        let active_path = self.paths.get_active_mut()?;
+        let peer_max_udp_payload_size = peer_params.max_udp_payload_size as usize;
+        let pmtud_maximum_supported_mtu = self
+            .local_transport_params
+            .max_udp_payload_size
+            .try_into()
+            .unwrap_or(self.recovery_config.max_send_udp_payload_size)
+            .min(self.recovery_config.max_send_udp_payload_size)
+            .min(peer_max_udp_payload_size);
+        let active_path_id = self.paths.get_active_path_id()?;
 
-        active_path.recovery.update_max_ack_delay(max_ack_delay);
+        for (path_id, path) in self.paths.iter_mut() {
+            let is_active = path_id == active_path_id;
+            if is_active {
+                path.recovery.update_max_ack_delay(max_ack_delay);
+            }
 
-        if active_path
-            .pmtud
-            .as_ref()
-            .map(|pmtud| pmtud.should_probe())
-            .unwrap_or(false)
-        {
-            active_path.recovery.pmtud_update_max_datagram_size(
-                active_path
-                    .pmtud
-                    .as_mut()
-                    .expect("PMTUD existence verified above")
-                    .get_probe_size()
-                    .min(peer_params.max_udp_payload_size as usize),
-            );
-        } else {
-            active_path.recovery.update_max_datagram_size(
-                peer_params.max_udp_payload_size as usize,
-            );
+            if let Some(pmtud) = path.pmtud.as_mut() {
+                pmtud.update_maximum_supported_mtu(pmtud_maximum_supported_mtu);
+                path.recovery
+                    .pmtud_update_max_datagram_size(pmtud.get_probe_size());
+            } else if is_active {
+                path.recovery
+                    .update_max_datagram_size(peer_max_udp_payload_size);
+            }
         }
 
         // Record the max_active_conn_id parameter advertised by the peer.
@@ -8062,6 +8166,8 @@ impl<F: BufFactory> Connection<F> {
                     }
 
                     if let Some((discover, max_probes)) = ex_data.pmtud {
+                        self.discover_pmtu = discover;
+                        self.pmtud_max_probes = max_probes;
                         self.paths.set_discover_pmtu_on_existing_paths(
                             discover,
                             self.recovery_config.max_send_udp_payload_size,
@@ -8978,6 +9084,7 @@ impl<F: BufFactory> Connection<F> {
         &mut self, recv_pid: Option<usize>, dcid: &ConnectionId, buf_len: usize,
         info: &RecvInfo,
     ) -> Result<usize> {
+        let pmtud_maximum_supported_mtu = self.pmtud_maximum_supported_mtu();
         let ids = &mut self.ids;
 
         let (in_scid_seq, mut in_scid_pid) =
@@ -9051,6 +9158,13 @@ impl<F: BufFactory> Connection<F> {
             false,
             None,
         );
+
+        if self.discover_pmtu {
+            path.pmtud = Some(pmtud::Pmtud::new(
+                pmtud_maximum_supported_mtu,
+                self.pmtud_max_probes,
+            ));
+        }
 
         path.max_send_bytes = buf_len * self.max_amplification_factor;
         path.active_scid_seq = Some(in_scid_seq);
@@ -9202,6 +9316,12 @@ impl<F: BufFactory> Connection<F> {
             false,
             None,
         );
+        if self.discover_pmtu {
+            path.pmtud = Some(pmtud::Pmtud::new(
+                self.pmtud_maximum_supported_mtu(),
+                self.pmtud_max_probes,
+            ));
+        }
         path.active_dcid_seq = Some(dcid_seq);
 
         let pid = self
@@ -9211,6 +9331,24 @@ impl<F: BufFactory> Connection<F> {
         self.ids.link_dcid_to_path_id(dcid_seq, pid)?;
 
         Ok(pid)
+    }
+
+    fn pmtud_maximum_supported_mtu(&self) -> usize {
+        let local_max_udp_payload_size = self
+            .local_transport_params
+            .max_udp_payload_size
+            .try_into()
+            .unwrap_or(self.recovery_config.max_send_udp_payload_size);
+        let peer_max_udp_payload_size = if self.parsed_peer_transport_params {
+            self.peer_transport_params.max_udp_payload_size as usize
+        } else {
+            usize::MAX
+        };
+
+        self.recovery_config
+            .max_send_udp_payload_size
+            .min(local_max_udp_payload_size)
+            .min(peer_max_udp_payload_size)
     }
 
     // Marks the connection as closed and does any related tidyup.
