@@ -618,6 +618,20 @@ impl ConnectionIdentifiers {
         self.scids.iter().map(|e| &e.cid)
     }
 
+    /// Returns an iterator over the source connection ID entries.
+    pub(crate) fn scid_entries_iter(
+        &self,
+    ) -> impl Iterator<Item = &ConnectionIdEntry> {
+        self.scids.iter()
+    }
+
+    /// Returns an iterator over the destination connection ID entries.
+    pub(crate) fn dcid_entries_iter(
+        &self,
+    ) -> impl Iterator<Item = &ConnectionIdEntry> {
+        self.dcids.iter()
+    }
+
     /// Updates the Source Connection ID entry with the provided sequence number
     /// to indicate that it is now linked to the provided path ID.
     pub fn link_scid_to_path_id(

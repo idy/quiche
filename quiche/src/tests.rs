@@ -53,6 +53,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        grease_quic_bit: false,
         unknown_params: Default::default(),
     };
 
@@ -83,6 +84,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        grease_quic_bit: false,
         unknown_params: Default::default(),
     };
 
@@ -94,6 +96,107 @@ fn transport_params() {
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();
 
     assert_eq!(new_tp, tp);
+}
+
+#[test]
+fn grease_quic_bit_transport_parameter() {
+    let tp = TransportParams {
+        grease_quic_bit: true,
+        ..TransportParams::default()
+    };
+
+    let mut encoded = [0; 256];
+    let encoded = TransportParams::encode(&tp, false, &mut encoded).unwrap();
+    let decoded = TransportParams::decode(encoded, true, None).unwrap();
+    assert!(decoded.grease_quic_bit);
+
+    // 0x2ab2 followed by an empty value.
+    let decoded = TransportParams::decode(&[0x6a, 0xb2, 0], true, None).unwrap();
+    assert!(decoded.grease_quic_bit);
+
+    // RFC 9287 requires the transport parameter value to be empty.
+    assert_eq!(
+        TransportParams::decode(&[0x6a, 0xb2, 1, 0], true, None),
+        Err(Error::InvalidTransportParam)
+    );
+}
+
+#[test]
+fn grease_quic_bit_packet_parsing_and_serialization() {
+    let cid = [1, 2, 3, 4];
+    let mut cleared = [0, 1, 2, 3, 4];
+    let mut input = octets::OctetsMut::with_slice(&mut cleared);
+    assert_eq!(
+        Header::from_bytes(&mut input, cid.len()),
+        Err(Error::InvalidPacket)
+    );
+
+    let mut input = octets::OctetsMut::with_slice(&mut cleared);
+    let parsed =
+        Header::from_bytes_with_grease(&mut input, cid.len(), true).unwrap();
+    assert_eq!(parsed.ty, Type::Short);
+    assert_eq!(parsed.dcid.as_ref(), cid);
+
+    let header = Header {
+        ty: Type::Short,
+        version: 0,
+        dcid: ConnectionId::from_ref(&cid),
+        scid: ConnectionId::default(),
+        pkt_num: 0,
+        pkt_num_len: 1,
+        token: None,
+        versions: None,
+        key_phase: false,
+    };
+    let mut default = [0; 5];
+    header
+        .to_bytes(&mut octets::OctetsMut::with_slice(&mut default))
+        .unwrap();
+    assert_ne!(default[0] & 0x40, 0);
+
+    let mut observed_set = false;
+    let mut observed_clear = false;
+    for _ in 0..1024 {
+        let mut randomized = [0; 5];
+        header
+            .to_bytes_with_grease(
+                &mut octets::OctetsMut::with_slice(&mut randomized),
+                true,
+            )
+            .unwrap();
+        observed_set |= randomized[0] & 0x40 != 0;
+        observed_clear |= randomized[0] & 0x40 == 0;
+    }
+    assert!(observed_set && observed_clear);
+}
+
+#[test]
+fn connection_id_metadata_exposes_sequence_and_reset_token() {
+    let mut pipe = test_utils::Pipe::new("cubic").unwrap();
+    pipe.handshake().unwrap();
+
+    let active = pipe.client.source_id_metadata();
+    assert_eq!(active.connection_id(), &pipe.client.source_id());
+    assert_eq!(active.sequence(), 0);
+
+    let cid = ConnectionId::from_ref(&[0x5a; 16]);
+    let reset_token = u128::from_be_bytes([0xa5; 16]);
+    assert_eq!(pipe.client.new_scid(&cid, reset_token, false), Ok(1));
+
+    let replacement = pipe
+        .client
+        .source_ids_metadata()
+        .find(|metadata| metadata.sequence() == 1)
+        .unwrap();
+    assert_eq!(replacement.connection_id().as_ref(), cid.as_ref());
+    assert_eq!(replacement.reset_token(), Some(reset_token));
+
+    let destination = pipe.client.destination_id_metadata();
+    assert_eq!(destination.connection_id(), &pipe.client.destination_id());
+    assert!(pipe
+        .client
+        .destination_ids_metadata()
+        .any(|metadata| metadata.sequence() == destination.sequence()));
 }
 
 #[test]

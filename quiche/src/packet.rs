@@ -355,9 +355,19 @@ impl<'a> Header<'a> {
     pub(crate) fn from_bytes<'b>(
         b: &'b mut octets::OctetsMut, dcid_len: usize,
     ) -> Result<Header<'a>> {
+        Self::from_bytes_with_grease(b, dcid_len, false)
+    }
+
+    pub(crate) fn from_bytes_with_grease<'b>(
+        b: &'b mut octets::OctetsMut, dcid_len: usize, grease_quic_bit: bool,
+    ) -> Result<Header<'a>> {
         let first = b.get_u8()?;
 
         if !Header::is_long(first) {
+            if first & FIXED_BIT == 0 && !grease_quic_bit {
+                return Err(Error::InvalidPacket);
+            }
+
             // Decode short header.
             let dcid = b.get_bytes(dcid_len)?;
 
@@ -376,6 +386,11 @@ impl<'a> Header<'a> {
 
         // Decode long header.
         let version = b.get_u32()?;
+
+        // The Fixed Bit is not defined for Version Negotiation packets.
+        if version != 0 && first & FIXED_BIT == 0 && !grease_quic_bit {
+            return Err(Error::InvalidPacket);
+        }
 
         let ty = if version == 0 {
             Type::VersionNegotiation
@@ -451,6 +466,12 @@ impl<'a> Header<'a> {
     }
 
     pub(crate) fn to_bytes(&self, out: &mut octets::OctetsMut) -> Result<()> {
+        self.to_bytes_with_grease(out, false)
+    }
+
+    pub(crate) fn to_bytes_with_grease(
+        &self, out: &mut octets::OctetsMut, grease_quic_bit: bool,
+    ) -> Result<()> {
         let mut first = 0;
 
         // Encode pkt num length.
@@ -461,8 +482,7 @@ impl<'a> Header<'a> {
             // Unset form bit for short header.
             first &= !FORM_BIT;
 
-            // Set fixed bit.
-            first |= FIXED_BIT;
+            set_fixed_bit(&mut first, grease_quic_bit);
 
             // Set key phase bit.
             if self.key_phase {
@@ -486,7 +506,8 @@ impl<'a> Header<'a> {
             _ => return Err(Error::InvalidPacket),
         };
 
-        first |= FORM_BIT | FIXED_BIT | (ty << 4);
+        first |= FORM_BIT | (ty << 4);
+        set_fixed_bit(&mut first, grease_quic_bit);
 
         out.put_u8(first)?;
 
@@ -530,6 +551,21 @@ impl<'a> Header<'a> {
     /// The `b` parameter represents the first byte of the QUIC header.
     fn is_long(b: u8) -> bool {
         b & FORM_BIT != 0
+    }
+}
+
+fn set_fixed_bit(first: &mut u8, grease_quic_bit: bool) {
+    if grease_quic_bit {
+        let mut random = [0];
+        rand::rand_bytes(&mut random);
+
+        if random[0] & 1 == 0 {
+            *first &= !FIXED_BIT;
+        } else {
+            *first |= FIXED_BIT;
+        }
+    } else {
+        *first |= FIXED_BIT;
     }
 }
 
