@@ -360,6 +360,7 @@ pub enum PacketAction {
 }
 
 /// A protocol action that the embedding application must execute.
+#[derive(Clone)]
 pub enum SessionAction {
     /// Encoded control bytes are ready for the request stream.
     WriteControl {
@@ -401,7 +402,8 @@ struct Association {
     target_mappings: Vec<Mapping>,
     pending_client: HashSet<Vec<u8>>,
     pending_target: HashSet<Vec<u8>>,
-    registrations: u64,
+    // Cumulative registrations sent or received, not active mappings.
+    registration_requests: u64,
     max_registrations: u64,
     exhausted_since: Option<Instant>,
     send_key: Option<[u8; 32]>,
@@ -433,7 +435,7 @@ impl Association {
             target_mappings: Vec::new(),
             pending_client: HashSet::new(),
             pending_target: HashSet::new(),
-            registrations: 0,
+            registration_requests: 0,
             max_registrations: 2,
             exhausted_since: None,
             send_key: None,
@@ -471,7 +473,7 @@ impl Association {
     }
 
     fn register(&mut self, capsule: Capsule, client: bool) -> Result<bool> {
-        if self.registrations >= self.max_registrations {
+        if self.registration_requests >= self.max_registrations {
             self.exhausted_since.get_or_insert_with(Instant::now);
             return Err(Error::Capacity);
         }
@@ -481,7 +483,7 @@ impl Association {
             _ => None,
         };
         let write_control = self.queue(capsule)?;
-        self.registrations += 1;
+        self.registration_requests += 1;
         if let Some(cid) = pending_cid {
             if client {
                 self.pending_client.insert(cid);
@@ -639,15 +641,18 @@ impl ClientEndpoint {
             },
             Err(error) => return Err(error),
         };
-        let mut association = self
+        let association = self
             .associations
             .remove(&id)
             .ok_or(Error::UnknownAssociation)?;
+        let mut candidate = association.clone();
+        let previous_actions = self.actions.clone();
         let handled = capsules.into_iter().try_for_each(|capsule| {
-            self.handle_client_capsule(id, &mut association, capsule)
+            self.handle_client_capsule(id, &mut candidate, capsule)
         });
-        self.associations.insert(id, association);
         if let Err(error) = handled {
+            self.actions = previous_actions;
+            self.associations.insert(id, association);
             if matches!(error, Error::ProtocolViolation | Error::Capacity) {
                 self.push_action(SessionAction::ResetStream {
                     association: id,
@@ -657,6 +662,7 @@ impl ClientEndpoint {
             }
             return Err(error);
         }
+        self.associations.insert(id, candidate);
         Ok(input.len())
     }
 
@@ -1261,15 +1267,18 @@ impl ProxyEndpoint {
             },
             Err(error) => return Err(error),
         };
-        let mut association = self
+        let association = self
             .associations
             .remove(&id)
             .ok_or(Error::UnknownAssociation)?;
+        let mut candidate = association.clone();
+        let previous_actions = self.actions.clone();
         let handled = capsules.into_iter().try_for_each(|capsule| {
-            self.handle_proxy_capsule(id, &mut association, capsule)
+            self.handle_proxy_capsule(id, &mut candidate, capsule)
         });
-        self.associations.insert(id, association);
         if let Err(error) = handled {
+            self.actions = previous_actions;
+            self.associations.insert(id, association);
             if matches!(error, Error::ProtocolViolation | Error::Capacity) {
                 self.push_action(SessionAction::ResetStream {
                     association: id,
@@ -1279,6 +1288,7 @@ impl ProxyEndpoint {
             }
             return Err(error);
         }
+        self.associations.insert(id, candidate);
         Ok(input.len())
     }
 
@@ -1688,10 +1698,12 @@ impl ProxyEndpoint {
                 {
                     return Err(Error::ProtocolViolation);
                 }
-                if association.registrations >= association.max_registrations {
+                if association.registration_requests >=
+                    association.max_registrations
+                {
                     return Err(Error::ProtocolViolation);
                 }
-                association.registrations += 1;
+                association.registration_requests += 1;
                 if cid.len() < 8 {
                     self.queue_proxy_capsule(
                         id,
@@ -1776,11 +1788,12 @@ impl ProxyEndpoint {
                 reset_token,
             } => {
                 if reason != capsule::DEFAULT_REASON ||
-                    association.registrations >= association.max_registrations
+                    association.registration_requests >=
+                        association.max_registrations
                 {
                     return Err(Error::ProtocolViolation);
                 }
-                association.registrations += 1;
+                association.registration_requests += 1;
                 let replaces_existing = association
                     .target_mappings
                     .iter()
@@ -1998,7 +2011,7 @@ fn sync_snapshots(
             *current = *reset_token;
             continue;
         }
-        if association.registrations >= association.max_registrations {
+        if association.registration_requests >= association.max_registrations {
             exhausted = true;
             continue;
         }
@@ -2016,7 +2029,7 @@ fn sync_snapshots(
             *current = *reset_token;
             continue;
         }
-        if association.registrations >= association.max_registrations {
+        if association.registration_requests >= association.max_registrations {
             exhausted = true;
             continue;
         }

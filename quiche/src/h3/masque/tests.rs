@@ -465,6 +465,122 @@ fn invalid_max_connection_ids_resets_the_request() {
 }
 
 #[test]
+fn capsule_batch_state_is_atomic_on_error() {
+    let outer = OuterConnectionId::from_u64(43);
+    let association = AssociationId::from_u64(44);
+    let mut client =
+        ClientEndpoint::new(ForwardingConfig::default(), outer, path(8700, 8800))
+            .unwrap();
+    client.open_association(association).unwrap();
+
+    let mut client_batch = Capsule::MaxConnectionIds(4).encode().unwrap();
+    client_batch.extend(Capsule::MaxConnectionIds(3).encode().unwrap());
+    assert_eq!(
+        client.receive_control(association, &client_batch),
+        Err(Error::ProtocolViolation)
+    );
+    assert_eq!(
+        client
+            .associations
+            .get(&association)
+            .unwrap()
+            .max_registrations,
+        2
+    );
+
+    let mut proxy = ProxyEndpoint::new(ForwardingConfig::default()).unwrap();
+    proxy
+        .associations
+        .insert(association, Association::new(outer, None));
+    let mut proxy_batch = Capsule::RegisterClient {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: vec![0xa1; 8],
+    }
+    .encode()
+    .unwrap();
+    proxy_batch.extend(Capsule::MaxConnectionIds(3).encode().unwrap());
+    assert_eq!(
+        proxy.receive_control(association, &proxy_batch),
+        Err(Error::ProtocolViolation)
+    );
+    let state = proxy.associations.get(&association).unwrap();
+    assert!(state.client_mappings.is_empty());
+    assert!(state.control.is_empty());
+    assert_eq!(state.registration_requests, 0);
+    assert!(matches!(
+        proxy.poll_action(),
+        Some(super::SessionAction::ResetStream {
+            association: value,
+            code: super::H3_DATAGRAM_ERROR,
+        }) if value == association
+    ));
+    assert!(proxy.poll_action().is_none());
+}
+
+#[test]
+fn registration_limit_counts_requests_cumulatively() {
+    let outer = OuterConnectionId::from_u64(45);
+    let association = AssociationId::from_u64(46);
+    let mut proxy = ProxyEndpoint::new(ForwardingConfig::default()).unwrap();
+    let mut state = Association::new(outer, None);
+    state.max_registrations = 3;
+    proxy.associations.insert(association, state);
+
+    let rejected = Capsule::RegisterClient {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: vec![0xa2; 7],
+    }
+    .encode()
+    .unwrap();
+    proxy.receive_control(association, &rejected).unwrap();
+
+    let target_cid = vec![0xa3; 8];
+    let target = Capsule::RegisterTarget {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: target_cid.clone(),
+        reset_token: None,
+    }
+    .encode()
+    .unwrap();
+    proxy.receive_control(association, &target).unwrap();
+    let close = Capsule::CloseTarget {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: target_cid,
+    }
+    .encode()
+    .unwrap();
+    proxy.receive_control(association, &close).unwrap();
+
+    let final_allowed = Capsule::RegisterTarget {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: vec![0xa4; 8],
+        reset_token: None,
+    }
+    .encode()
+    .unwrap();
+    proxy.receive_control(association, &final_allowed).unwrap();
+    let over_limit = Capsule::RegisterTarget {
+        reason: super::capsule::DEFAULT_REASON,
+        cid: vec![0xa5; 8],
+        reset_token: None,
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(
+        proxy.receive_control(association, &over_limit),
+        Err(Error::ProtocolViolation)
+    );
+    assert_eq!(
+        proxy
+            .associations
+            .get(&association)
+            .unwrap()
+            .registration_requests,
+        3
+    );
+}
+
+#[test]
 fn capsule_support_gates_both_negotiated_capabilities() {
     let mut disabled = ForwardingConfig::default();
     disabled.set_transforms(&[]).unwrap();
@@ -929,7 +1045,7 @@ fn cid_snapshot_sync_is_atomic_when_actions_are_full() {
     assert!(state.pending_client.is_empty());
     assert!(state.pending_target.is_empty());
     assert!(state.control.is_empty());
-    assert_eq!(state.registrations, 0);
+    assert_eq!(state.registration_requests, 0);
 }
 
 #[test]
@@ -959,6 +1075,14 @@ fn active_migration_discards_stale_mapping_control() {
             new_client_path.peer,
         ))
         .unwrap();
+    assert_eq!(
+        client
+            .associations
+            .get(&association)
+            .unwrap()
+            .registration_requests,
+        2
+    );
     let mut output = [0; 1024];
     assert_eq!(
         client.poll_control(association, &mut output),
@@ -975,6 +1099,14 @@ fn active_migration_discards_stale_mapping_control() {
     client
         .sync_inner_connection_ids(association, &pipe.client)
         .unwrap();
+    assert_eq!(
+        client
+            .associations
+            .get(&association)
+            .unwrap()
+            .registration_requests,
+        4
+    );
     assert!(client.poll_control(association, &mut output).is_ok());
     assert!(client.poll_control(association, &mut output).is_ok());
     assert_eq!(
