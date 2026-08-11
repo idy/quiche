@@ -1487,9 +1487,11 @@ impl ProxyEndpoint {
         };
         if let Some(dcid) = long_dcid {
             let mut matched = self.outers.iter().filter_map(|(id, outer)| {
-                (outer.path == path &&
-                    outer.cids.iter().any(|cid| cid.as_slice() == dcid))
-                .then_some(*id)
+                outer
+                    .cids
+                    .iter()
+                    .any(|cid| cid.as_slice() == dcid)
+                    .then_some(*id)
             });
             let Some(connection) = matched.next() else {
                 return Ok(PacketAction::Drop(DropReason::UnknownCid));
@@ -1502,11 +1504,10 @@ impl ProxyEndpoint {
 
         let mut outer_match = None;
         for (outer_id, outer) in &self.outers {
-            if outer.path == path &&
-                outer
-                    .cids
-                    .iter()
-                    .any(|cid| mapping::packet_cid_matches(packet, cid))
+            if outer
+                .cids
+                .iter()
+                .any(|cid| mapping::packet_cid_matches(packet, cid))
             {
                 if outer_match.is_some() {
                     return Ok(PacketAction::Drop(DropReason::ConflictingCid));

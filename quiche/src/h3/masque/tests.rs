@@ -906,12 +906,13 @@ fn ambiguous_outer_and_forwarded_cids_are_dropped() {
 #[test]
 fn long_header_demux_rejects_ambiguous_outer_connections() {
     let forwarding_path = path(6100, 6200);
+    let alternate_path = path(6300, 6400);
     let first = OuterConnectionId::from_u64(18);
     let second = OuterConnectionId::from_u64(19);
     let cid = vec![0x83; 8];
     let mut proxy = ProxyEndpoint::new(ForwardingConfig::default()).unwrap();
     proxy.attach_outer(first, forwarding_path).unwrap();
-    proxy.attach_outer(second, forwarding_path).unwrap();
+    proxy.attach_outer(second, alternate_path).unwrap();
     proxy
         .outers
         .get_mut(&first)
@@ -935,6 +936,51 @@ fn long_header_demux_rejects_ambiguous_outer_connections() {
             )
             .unwrap(),
         PacketAction::Drop(super::DropReason::ConflictingCid)
+    ));
+}
+
+#[test]
+fn known_outer_cids_reach_quic_from_a_new_path() {
+    let outer = OuterConnectionId::from_u64(47);
+    let association = AssociationId::from_u64(48);
+    let old_path = path(8900, 9000);
+    let new_path = path(9100, 9200);
+    let outer_cid = vec![0xa6; 8];
+    let forwarded_cid = vec![0xa7; 8];
+    let mut proxy = ProxyEndpoint::new(ForwardingConfig::default()).unwrap();
+    proxy.attach_outer(outer, old_path).unwrap();
+    proxy
+        .outers
+        .get_mut(&outer)
+        .unwrap()
+        .cids
+        .insert(outer_cid.clone());
+
+    for mut packet in [long_packet(&outer_cid), short_packet(&outer_cid)] {
+        assert!(matches!(
+            proxy
+                .route_from_client(new_path, EcnCodepoint::NotEct, &mut packet)
+                .unwrap(),
+            PacketAction::OuterQuic { connection } if connection == outer
+        ));
+    }
+
+    let mut state = Association::new(outer, Some(path(9300, 9400)));
+    state.mode =
+        super::NegotiatedMode::new(Some(PacketTransform::Identity), false);
+    state.target_mappings.push(Mapping {
+        cid: vec![0xa8; 8],
+        vcid: forwarded_cid.clone(),
+        reset_token: None,
+        acknowledged: true,
+    });
+    proxy.associations.insert(association, state);
+    let mut packet = short_packet(&forwarded_cid);
+    assert!(matches!(
+        proxy
+            .route_from_client(new_path, EcnCodepoint::NotEct, &mut packet)
+            .unwrap(),
+        PacketAction::Drop(super::DropReason::UnknownCid)
     ));
 }
 
