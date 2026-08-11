@@ -55,12 +55,21 @@ internal = []
 # Enable qlog support with serde_json for extension data
 qlog = ["dep:qlog", "dep:serde", "dep:serde_json", "dep:serde_with"]
 
+# Experimental QUIC-aware CONNECT-UDP forwarding pinned to
+# draft-ietf-masque-quic-proxy-09.
+masque-quic-proxy = ["sfv", "boringssl-boring-crate"]
+
 [package.metadata.release]
 tag-prefix = ""
 
 [package.metadata.docs.rs]
 no-default-features = true
-features = ["boringssl-boring-crate", "qlog", "custom-client-dcid"]
+features = [
+    "boringssl-boring-crate",
+    "qlog",
+    "custom-client-dcid",
+    "masque-quic-proxy",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [build-dependencies]

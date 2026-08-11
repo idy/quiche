@@ -189,6 +189,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Whether RFC 9287 QUIC Bit greasing is supported.
+    pub grease_quic_bit: bool,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -214,6 +216,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            grease_quic_bit: false,
             unknown_params: Default::default(),
         }
     }
@@ -372,6 +375,14 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                0x2ab2 => {
+                    if val.cap() != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    tp.grease_quic_bit = true;
                 },
 
                 // Track unknown transport parameters specially.
@@ -557,6 +568,10 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        if tp.grease_quic_bit {
+            TransportParams::encode_param(&mut b, 0x2ab2, 0)?;
         }
 
         let out_len = b.off();

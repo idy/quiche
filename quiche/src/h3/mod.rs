@@ -8546,6 +8546,10 @@ mod tests {
     }
 }
 
+#[cfg(feature = "masque-quic-proxy")]
+#[cfg_attr(docsrs, doc(cfg(feature = "masque-quic-proxy")))]
+pub mod masque;
+
 #[cfg(feature = "ffi")]
 mod ffi;
 #[cfg(feature = "internal")]

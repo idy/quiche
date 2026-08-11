@@ -17,6 +17,25 @@ you can read a [post] on Cloudflare's blog that goes into some more detail.
 [ietf]: https://quicwg.org/
 [post]: https://blog.cloudflare.com/enjoy-a-slice-of-quic-and-rust/
 
+Experimental QUIC-aware CONNECT-UDP forwarding
+----------------------------------------------
+
+The non-default `masque-quic-proxy` feature exposes an experimental Rust-only
+client and proxy API for QUIC-aware CONNECT-UDP forwarding. Its wire behavior is
+pinned to `draft-ietf-masque-quic-proxy-09`; later drafts and the eventual RFC
+can be wire-incompatible and require a separately reviewed update.
+
+The API lives in `quiche::h3::masque`. It owns negotiation, bounded Capsule and
+CID mapping state, packet classification, and the `identity` and `scramble-dt`
+transforms. The embedding application continues to own HTTP request policy,
+UDP sockets, stream and datagram I/O, polling, timers, and execution of the
+typed actions returned by the module. No C API is exposed for this feature.
+
+Forwarded short-header packets are treated as opaque QUIC packets using only
+version-invariant header properties and registered CID lengths. Long-header
+packets and packets without acknowledged mappings remain on the ordinary
+CONNECT-UDP path.
+
 Who uses quiche?
 ----------------
 

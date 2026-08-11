@@ -558,6 +558,28 @@ pub enum QlogLevel {
     Extra = 2,
 }
 
+/// Borrowed metadata for an active QUIC connection ID.
+pub struct ConnectionIdMetadata<'a> {
+    entry: &'a cid::ConnectionIdEntry,
+}
+
+impl<'a> ConnectionIdMetadata<'a> {
+    /// Returns the connection ID bytes.
+    pub fn connection_id(&self) -> &ConnectionId<'a> {
+        &self.entry.cid
+    }
+
+    /// Returns the QUIC connection ID sequence number.
+    pub fn sequence(&self) -> u64 {
+        self.entry.seq
+    }
+
+    /// Returns the stateless reset token, when one is available.
+    pub fn reset_token(&self) -> Option<u128> {
+        self.entry.reset_token
+    }
+}
+
 /// Stores configuration shared between multiple connections.
 pub struct Config {
     local_transport_params: TransportParams,
@@ -1073,6 +1095,14 @@ impl Config {
     /// The default value is `false`.
     pub fn set_disable_active_migration(&mut self, v: bool) {
         self.local_transport_params.disable_active_migration = v;
+    }
+
+    /// Enables RFC 9287 QUIC Bit greasing for new connections.
+    ///
+    /// When enabled, the endpoint advertises the empty `grease_quic_bit`
+    /// transport parameter and accepts packets whose Fixed Bit is zero.
+    pub fn enable_grease_quic_bit(&mut self, enabled: bool) {
+        self.local_transport_params.grease_quic_bit = enabled;
     }
 
     /// Sets the congestion control algorithm used.
@@ -2989,15 +3019,14 @@ impl<F: BufFactory> Connection<F> {
 
         let mut b = octets::OctetsMut::with_slice(buf);
 
-        let mut hdr = Header::from_bytes(&mut b, self.source_id().len())
-            .map_err(|e| {
-                drop_pkt_on_err(
-                    e,
-                    self.recv_count,
-                    self.is_server,
-                    &self.trace_id,
-                )
-            })?;
+        let mut hdr = Header::from_bytes_with_grease(
+            &mut b,
+            self.source_id().len(),
+            self.local_transport_params.grease_quic_bit,
+        )
+        .map_err(|e| {
+            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+        })?;
 
         if hdr.ty == Type::VersionNegotiation {
             // Version negotiation packets can only be sent by the server.
@@ -4449,7 +4478,11 @@ impl<F: BufFactory> Connection<F> {
             key_phase: self.key_phase,
         };
 
-        hdr.to_bytes(&mut b)?;
+        hdr.to_bytes_with_grease(
+            &mut b,
+            self.parsed_peer_transport_params &&
+                self.peer_transport_params.grease_quic_bit,
+        )?;
 
         let hdr_trace = if log::max_level() == log::LevelFilter::Trace {
             Some(format!("{hdr:?}"))
@@ -7679,6 +7712,31 @@ impl<F: BufFactory> Connection<F> {
         self.ids.scids_iter()
     }
 
+    /// Returns metadata for the source connection ID selected by
+    /// [`source_id()`].
+    pub fn source_id_metadata(&self) -> ConnectionIdMetadata<'_> {
+        if let Ok(path) = self.paths.get_active() {
+            if let Some(active_scid_seq) = path.active_scid_seq {
+                if let Ok(entry) = self.ids.get_scid(active_scid_seq) {
+                    return ConnectionIdMetadata { entry };
+                }
+            }
+        }
+
+        ConnectionIdMetadata {
+            entry: self.ids.oldest_scid(),
+        }
+    }
+
+    /// Returns metadata for all active source connection IDs.
+    pub fn source_ids_metadata(
+        &self,
+    ) -> impl Iterator<Item = ConnectionIdMetadata<'_>> {
+        self.ids
+            .scid_entries_iter()
+            .map(|entry| ConnectionIdMetadata { entry })
+    }
+
     /// Returns the destination connection ID.
     ///
     /// Note that the value returned can change throughout the connection's
@@ -7695,6 +7753,37 @@ impl<F: BufFactory> Connection<F> {
 
         let e = self.ids.oldest_dcid();
         ConnectionId::from_ref(e.cid.as_ref())
+    }
+
+    /// Returns metadata for the destination connection ID selected by
+    /// [`destination_id()`].
+    pub fn destination_id_metadata(&self) -> ConnectionIdMetadata<'_> {
+        if let Ok(path) = self.paths.get_active() {
+            if let Some(active_dcid_seq) = path.active_dcid_seq {
+                if let Ok(entry) = self.ids.get_dcid(active_dcid_seq) {
+                    return ConnectionIdMetadata { entry };
+                }
+            }
+        }
+
+        ConnectionIdMetadata {
+            entry: self.ids.oldest_dcid(),
+        }
+    }
+
+    /// Returns metadata for all active destination connection IDs.
+    pub fn destination_ids_metadata(
+        &self,
+    ) -> impl Iterator<Item = ConnectionIdMetadata<'_>> {
+        self.ids
+            .dcid_entries_iter()
+            .map(|entry| ConnectionIdMetadata { entry })
+    }
+
+    /// Returns whether the peer advertised RFC 9287 QUIC Bit greasing.
+    pub fn peer_grease_quic_bit(&self) -> bool {
+        self.parsed_peer_transport_params &&
+            self.peer_transport_params.grease_quic_bit
     }
 
     /// Returns the PMTU for the active path if it exists.
